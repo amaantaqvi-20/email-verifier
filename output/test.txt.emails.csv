@@ -1,0 +1,3 @@
+filename,email,verdict,active_status,reasons
+test.txt,bob@mailinator.com,risky,inactive,disposable-domain
+test.txt,alice@example.com,risky,unknown,smtp-unknown
