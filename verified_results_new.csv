@@ -1,0 +1,5 @@
+email,verdict,reason
+fake@notreal123.com,bad,invalid syntax
+test@gmail.com,risky,SMTP inconclusive
+hello@example.com,bad,invalid syntax
+info@company.com,bad,no MX record

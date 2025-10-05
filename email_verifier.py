@@ -11,7 +11,6 @@ import threading
 import concurrent.futures
 from typing import List, Dict, Tuple, Optional, Set
 from collections import defaultdict
-
 import dns.resolver
 from email_validator import validate_email, EmailNotValidError
 from tqdm import tqdm
@@ -19,9 +18,7 @@ import tldextract
 import hashlib
 import json
 
-# ==========================================================
-# LICENSE MANAGEMENT
-# ==========================================================
+# License Management
 LICENSE_FILE = "config.json"
 
 def get_hash(email: str) -> str:
@@ -59,10 +56,8 @@ def activate_license(email: str, key: str) -> bool:
         return True
     return False
 
-# ==========================================================
-# CONFIGURATION
-# ==========================================================
-EMAIL_RE = re.compile(r"([a-zA-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})")
+# Configuration
+EMAIL_RE = re.compile(r'[^\s,;<>]+@[^\s,;<>]+')  # Simplified regex
 DEFAULT_DB = "email_cache_v3.db"
 DEFAULT_WORKERS = 60
 MX_TIMEOUT = 3
@@ -76,9 +71,7 @@ DISPOSABLE_DOMAINS = {
 
 DB_LOCK = threading.Lock()
 
-# ==========================================================
-# CACHE HANDLING
-# ==========================================================
+# Cache Handling
 def init_cache(db_path=DEFAULT_DB):
     with DB_LOCK:
         conn = sqlite3.connect(db_path)
@@ -120,22 +113,25 @@ def write_cache(db_path, email, verdict, reason, active_status, mx_domain):
     except Exception:
         pass
 
-# ==========================================================
-# UTILITIES
-# ==========================================================
+# Utilities
 def extract_emails_from_text(text: str) -> List[str]:
-    return list({m.group(1).strip().lower() for m in EMAIL_RE.finditer(text)})
+    emails = list({m.group(0).strip().lower() for m in EMAIL_RE.finditer(text)})
+    # Debug: Log extracted emails
+    with open("debug_emails.log", "a") as f:
+        f.write(f"Extracted emails: {emails}\n")
+    return emails
 
 def domain_from_email(email: str) -> str:
-    return email.split("@", 1)[1].lower()
+    try:
+        return email.split("@", 1)[1].lower()
+    except IndexError:
+        return ""
 
 def is_disposable(domain: str) -> bool:
     base = tldextract.extract(domain).registered_domain or domain
     return base in DISPOSABLE_DOMAINS
 
-# ==========================================================
-# DNS / MX RESOLUTION
-# ==========================================================
+# DNS / MX Resolution
 def resolve_mx(domain: str):
     try:
         answers = dns.resolver.resolve(domain, "MX", lifetime=MX_TIMEOUT)
@@ -152,9 +148,7 @@ def resolve_mx_bulk(domains: Set[str], max_workers=30):
             results[d] = mx
     return results
 
-# ==========================================================
-# SMTP VALIDATION
-# ==========================================================
+# SMTP Validation
 def smtp_probe(mx_host, email):
     try:
         conn = socket.create_connection((mx_host, SMTP_PORT), timeout=SMTP_TIMEOUT)
@@ -179,9 +173,7 @@ def smtp_probe(mx_host, email):
     except Exception:
         return "unknown"
 
-# ==========================================================
-# CLASSIFY EMAIL
-# ==========================================================
+# Classify Email
 def classify_email(email, mx_cache, db_path, premium):
     email = email.lower().strip()
     cached = read_cache(db_path, email)
@@ -196,6 +188,10 @@ def classify_email(email, mx_cache, db_path, premium):
         return {"email": email, "verdict": "bad", "reason": "invalid", "active_status": "inactive"}
 
     domain = domain_from_email(email)
+    if not domain:
+        write_cache(db_path, email, "bad", "invalid_domain", "inactive", None)
+        return {"email": email, "verdict": "bad", "reason": "invalid_domain", "active_status": "inactive"}
+
     if is_disposable(domain):
         write_cache(db_path, email, "risky", "disposable", "unknown", domain)
         return {"email": email, "verdict": "risky", "reason": "disposable", "active_status": "unknown"}
@@ -220,30 +216,41 @@ def classify_email(email, mx_cache, db_path, premium):
     write_cache(db_path, email, "good", "syntax+mx", "unknown", domain)
     return {"email": email, "verdict": "good", "reason": "syntax+mx", "active_status": "unknown"}
 
-# ==========================================================
-# MAIN VERIFICATION RUNNER
-# ==========================================================
-def run_verification(input_path, output_path, workers, premium, db_path):
+# Main Verification Runner
+def run_verification(input_path, output_path, workers, premium, db_path, job_id=None, progress_store=None):
     init_cache(db_path)
     os.makedirs(output_path, exist_ok=True)
     emails = []
 
+    # Debug: Log input path
+    with open("debug_emails.log", "a") as f:
+        f.write(f"Processing input: {input_path}\n")
+
     if os.path.isdir(input_path):
         for fn in os.listdir(input_path):
-            if fn.endswith(".txt") or fn.endswith(".csv"):
+            if fn.endswith((".txt", ".csv")):
                 with open(os.path.join(input_path, fn), "r", encoding="utf-8", errors="ignore") as f:
                     emails += extract_emails_from_text(f.read())
     elif os.path.isfile(input_path):
         with open(input_path, "r", encoding="utf-8", errors="ignore") as f:
             emails += extract_emails_from_text(f.read())
     else:
-        print("❌ Input not found.")
+        with open("debug_emails.log", "a") as f:
+            f.write(f"Input not found: {input_path}\n")
+        if progress_store and job_id:
+            progress_store[job_id]["status"] = "error"
+            progress_store[job_id]["error"] = "Input file or directory not found"
         return
 
     emails = list(set(emails))
-    print(f"\nFound {len(emails)} emails.")
-    domains = {domain_from_email(e) for e in emails}
-    print(f"Resolving MX for {len(domains)} domains...")
+    with open("debug_emails.log", "a") as f:
+        f.write(f"Found emails: {emails}\n")
+    if progress_store and job_id:
+        progress_store[job_id]["total"] = len(emails)
+
+    domains = {domain_from_email(e) for e in emails if domain_from_email(e)}
+    with open("debug_emails.log", "a") as f:
+        f.write(f"Resolving MX for domains: {domains}\n")
     mx_cache = resolve_mx_bulk(domains, max_workers=workers)
 
     results = []
@@ -251,6 +258,8 @@ def run_verification(input_path, output_path, workers, premium, db_path):
         futures = [ex.submit(classify_email, e, mx_cache, db_path, premium) for e in emails]
         for fut in tqdm(concurrent.futures.as_completed(futures), total=len(futures), desc="Verifying"):
             results.append(fut.result())
+            if progress_store and job_id:
+                progress_store[job_id]["done"] += 1
 
     out = os.path.join(output_path, "verified_results.csv")
     if os.path.exists(out):
@@ -261,19 +270,20 @@ def run_verification(input_path, output_path, workers, premium, db_path):
         writer.writeheader()
         writer.writerows(results)
 
-    print(f"\n✅ Done! Results saved to {out}")
+    with open("debug_emails.log", "a") as f:
+        f.write(f"Results saved to: {out}\n")
 
-# ==========================================================
-# MAIN ENTRY FOR CLI / EXE
-# ==========================================================
+# Main Entry for CLI / API
 def main(args):
-    """Entry point for CLI (used by cli.py)"""
+    """Entry point for CLI and API"""
     run_verification(
         input_path=args.input,
         output_path=args.output,
         workers=args.workers,
         premium=args.premium,
         db_path="email_cache_v3.db",
+        job_id=getattr(args, 'job_id', None),
+        progress_store=getattr(args, 'progress_store', None),
     )
 
 if __name__ == "__main__":
@@ -308,7 +318,6 @@ if __name__ == "__main__":
     parser.add_argument("--premium", action="store_true", help="Enable deeper SMTP checks (optional override)")
     args = parser.parse_args()
 
-    # If user passed --premium, override license
     if args.premium:
         premium = True
 

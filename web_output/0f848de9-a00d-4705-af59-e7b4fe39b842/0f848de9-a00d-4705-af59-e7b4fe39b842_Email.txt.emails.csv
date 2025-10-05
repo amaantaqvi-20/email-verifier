@@ -1,0 +1,5 @@
+filename,email,verdict,reasons
+0f848de9-a00d-4705-af59-e7b4fe39b842_Email.txt,amaan@gmail.in,bad,no-mx-record
+0f848de9-a00d-4705-af59-e7b4fe39b842_Email.txt,amaan@indianconvention.com,good,smtp-rcpt-accept;mx:smtp.google.com
+0f848de9-a00d-4705-af59-e7b4fe39b842_Email.txt,amaataqvi@gmail.com,bad,smtp-rcpt-reject
+0f848de9-a00d-4705-af59-e7b4fe39b842_Email.txt,aman@gmail.com,bad,smtp-rcpt-reject

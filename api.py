@@ -6,12 +6,10 @@ import threading
 from fastapi import FastAPI, UploadFile, File, Query
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-
 import email_verifier
 
-# --------------------------- FastAPI Setup ---------------------------
+# FastAPI Setup
 app = FastAPI(title="Email Verifier API", version="1.2")
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -20,22 +18,19 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --------------------------- Config Paths ---------------------------
+# Config Paths
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-UPLOAD_DIR = os.path.join(BASE_DIR, "uploads")
+UPLOAD_DIR = os.path.join(BASE_DIR, "Uploads")
 OUTPUT_DIR = os.path.join(BASE_DIR, "output")
-
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-# --------------------------- Progress Store ---------------------------
-# Each job: {done: int, total: int, status: "running"/"done"/"error"}
+# Progress Store
 PROGRESS = {}
 
-# --------------------------- Background Worker ---------------------------
+# Background Worker
 def run_verifier(job_id, input_path, output_path, premium, provider, api_key):
     try:
-        # include progress tracking info
         args = argparse.Namespace(
             input=input_path,
             output=output_path,
@@ -51,9 +46,11 @@ def run_verifier(job_id, input_path, output_path, premium, provider, api_key):
     except Exception as e:
         PROGRESS[job_id]["status"] = "error"
         PROGRESS[job_id]["error"] = str(e)
+        # Log error to file
+        with open(os.path.join(OUTPUT_DIR, f"{job_id}_error.log"), "w") as f:
+            f.write(str(e))
 
-# --------------------------- Endpoints ---------------------------
-
+# Endpoints
 @app.post("/upload")
 async def upload_file(
     file: UploadFile = File(...),
@@ -75,7 +72,7 @@ async def upload_file(
             shutil.copyfileobj(file.file, buffer)
 
         # Initialize progress tracking
-        PROGRESS[job_id] = {"done": 0, "total": 0, "status": "running"}
+        PROGRESS[job_id] = {"done": 0, "total": 0, "status": "running", "error": None}
 
         # Start background worker thread
         thread = threading.Thread(
@@ -88,7 +85,6 @@ async def upload_file(
 
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
-
 
 @app.get("/progress/{job_id}")
 async def check_progress(job_id: str):
@@ -105,8 +101,8 @@ async def check_progress(job_id: str):
         "total": total,
         "percent": percent,
         "status": prog.get("status"),
+        "error": prog.get("error")
     }
-
 
 @app.get("/download/{job_id}")
 async def download_result(job_id: str):

@@ -1,0 +1,5 @@
+filename,email,verdict,reasons
+Email.txt,aman@gmail.com,good,syntax+mx-ok
+Email.txt,amaan@indianconvention.com,good,syntax+mx-ok
+Email.txt,amaataqvi@gmail.com,good,syntax+mx-ok
+Email.txt,amaan@gmail.in,bad,no-mx-record

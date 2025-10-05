@@ -1,0 +1,4 @@
+email,verdict,reason,active_status
+alice@example.com,bad,invalid-syntax,inactive
+bob@mailinator.com,risky,disposable-domain,unknown
+invalid@@,bad,invalid,inactive
