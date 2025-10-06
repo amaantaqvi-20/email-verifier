@@ -1,225 +1,324 @@
-"""
-Email Verifier with Live Progress (TXT + CSV)
----------------------------------------------
-
-- Free: Syntax + MX + Disposable + Lightweight SMTP
-- Premium (--premium): Full SMTP retries, deeper checks
-- Progress updates per email via shared PROGRESS dict
-"""
-
-import argparse
+from __future__ import annotations
 import os
 import re
 import csv
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import List, Dict, Optional
-
-import pandas as pd
-import tldextract
+import time
+import random
+import socket
+import argparse
+import sqlite3
+import threading
+import concurrent.futures
+from typing import List, Dict, Tuple, Optional, Set
+from collections import defaultdict
 import dns.resolver
-from smtplib import SMTP
+from email_validator import validate_email, EmailNotValidError
+from tqdm import tqdm
+import tldextract
+import hashlib
+import json
 
-# --------------------------- Config ---------------------------
-EMAIL_REGEX = re.compile(r"([a-zA-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})")
+# License Management
+LICENSE_FILE = "config.json"
+
+def get_hash(email: str) -> str:
+    """Generate license key hash based on email"""
+    return hashlib.sha256(email.encode()).hexdigest()[:12]
+
+def init_license():
+    """Initialize blank license config if not found"""
+    if not os.path.exists(LICENSE_FILE):
+        with open(LICENSE_FILE, "w") as f:
+            json.dump({"email": "", "key": "", "premium": False, "activated_on": None}, f, indent=2)
+
+def get_license_info():
+    try:
+        with open(LICENSE_FILE, "r") as f:
+            return json.load(f)
+    except Exception:
+        return {"email": "", "key": "", "premium": False, "activated_on": None}
+
+def is_premium():
+    info = get_license_info()
+    return info.get("premium", False)
+
+def activate_license(email: str, key: str) -> bool:
+    """Activate license if key matches generated hash"""
+    correct = get_hash(email)
+    if key.strip() == correct:
+        with open(LICENSE_FILE, "w") as f:
+            json.dump({
+                "email": email,
+                "key": key,
+                "premium": True,
+                "activated_on": time.strftime("%Y-%m-%d"),
+            }, f, indent=2)
+        return True
+    return False
+
+# Configuration
+EMAIL_RE = re.compile(r'[^\s,;<>]+@[^\s,;<>]+')  # Simplified regex
+DEFAULT_DB = "email_cache_v3.db"
+DEFAULT_WORKERS = 60
+MX_TIMEOUT = 3
+SMTP_TIMEOUT = 6
+SMTP_PORT = 25
+
 DISPOSABLE_DOMAINS = {
-    'mailinator.com','10minutemail.com','yopmail.com',
-    'guerrillamail.com','trashmail.com','tempmail.com','getnada.com'
+    "mailinator.com", "10minutemail.com", "yopmail.com", "guerrillamail.com",
+    "trashmail.com", "tempmail.com", "tempmail.net", "getnada.com", "dispostable.com"
 }
-DNS_TIMEOUT = 5.0
-SMTP_TIMEOUT = 5.0
-MAX_WORKERS = 10
 
-# --------------------------- Utils ---------------------------
+DB_LOCK = threading.Lock()
 
-def find_emails_in_text(text: str) -> List[str]:
-    return list({m.group(1).strip() for m in EMAIL_REGEX.finditer(text)})
+# Cache Handling
+def init_cache(db_path=DEFAULT_DB):
+    with DB_LOCK:
+        conn = sqlite3.connect(db_path)
+        cur = conn.cursor()
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS cache (
+                email TEXT PRIMARY KEY,
+                verdict TEXT,
+                reason TEXT,
+                active_status TEXT,
+                mx_domain TEXT,
+                last_checked INTEGER
+            )
+        """)
+        conn.commit()
+        conn.close()
 
-def is_syntax_valid(email: str) -> bool:
-    return bool(EMAIL_REGEX.fullmatch(email))
+def read_cache(db_path, email):
+    try:
+        conn = sqlite3.connect(db_path)
+        cur = conn.cursor()
+        cur.execute("SELECT verdict, reason, active_status, mx_domain, last_checked FROM cache WHERE email=?", (email,))
+        row = cur.fetchone()
+        conn.close()
+        return row
+    except Exception:
+        return None
+
+def write_cache(db_path, email, verdict, reason, active_status, mx_domain):
+    try:
+        conn = sqlite3.connect(db_path)
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT OR REPLACE INTO cache VALUES (?, ?, ?, ?, ?, strftime('%s','now'))",
+            (email, verdict, reason, active_status, mx_domain),
+        )
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass
+
+# Utilities
+def extract_emails_from_text(text: str) -> List[str]:
+    emails = list({m.group(0).strip().lower() for m in EMAIL_RE.finditer(text)})
+    # Debug: Log extracted emails
+    with open("debug_emails.log", "a") as f:
+        f.write(f"Extracted emails: {emails}\n")
+    return emails
 
 def domain_from_email(email: str) -> str:
-    return email.split('@', 1)[1].lower()
+    try:
+        return email.split("@", 1)[1].lower()
+    except IndexError:
+        return ""
 
-def is_disposable_domain(domain: str) -> bool:
-    base = tldextract.extract(domain).top_domain_under_public_suffix
+def is_disposable(domain: str) -> bool:
+    base = tldextract.extract(domain).registered_domain or domain
     return base in DISPOSABLE_DOMAINS
 
-def has_mx_record(domain: str) -> bool:
+# DNS / MX Resolution
+def resolve_mx(domain: str):
     try:
-        answers = dns.resolver.resolve(domain, 'MX', lifetime=DNS_TIMEOUT)
-        return len(answers) > 0
+        answers = dns.resolver.resolve(domain, "MX", lifetime=MX_TIMEOUT)
+        return domain, [str(r.exchange).rstrip(".") for r in answers]
     except Exception:
-        return False
+        return domain, []
 
-# --------------------------- SMTP check ---------------------------
+def resolve_mx_bulk(domains: Set[str], max_workers=30):
+    results = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(max_workers, len(domains) or 1)) as ex:
+        futures = {ex.submit(resolve_mx, d): d for d in domains}
+        for fut in concurrent.futures.as_completed(futures):
+            d, mx = fut.result()
+            results[d] = mx
+    return results
 
-def smtp_check(email: str, domain: str, premium: bool) -> str:
-    """Lightweight SMTP check (free) or deeper (premium)."""
+# SMTP Validation
+def smtp_probe(mx_host, email):
     try:
-        answers = dns.resolver.resolve(domain, "MX", lifetime=DNS_TIMEOUT)
-        mx_host = str(answers[0].exchange).rstrip(".")
-        server = SMTP(timeout=SMTP_TIMEOUT if not premium else 8)
-        server.connect(mx_host)
-        server.helo()
-        server.mail("no-reply@example.com")
-        code, _ = server.rcpt(email)
-        server.quit()
-        if 200 <= code < 300:
+        conn = socket.create_connection((mx_host, SMTP_PORT), timeout=SMTP_TIMEOUT)
+        f = conn.makefile("rwb", buffering=0)
+
+        def send(cmd): f.write((cmd + "\r\n").encode()); f.flush()
+        def recv(): return f.readline().decode(errors="ignore").strip()
+
+        recv()
+        send("EHLO example.com"); recv()
+        send("MAIL FROM:<verify@example.com>"); recv()
+        send(f"RCPT TO:<{email}>")
+        resp = recv()
+        conn.close()
+
+        if resp.startswith("250"):
             return "active"
-        elif 500 <= code < 600:
+        elif resp.startswith("550") or resp.startswith("551"):
             return "inactive"
         else:
             return "unknown"
     except Exception:
         return "unknown"
 
-# --------------------------- Classification ---------------------------
+# Classify Email
+def classify_email(email, mx_cache, db_path, premium):
+    email = email.lower().strip()
+    cached = read_cache(db_path, email)
+    if cached:
+        verdict, reason, active, domain, _ = cached
+        return {"email": email, "verdict": verdict, "reason": reason, "active_status": active}
 
-def classify_email(email: str, premium: bool, mx_cache: dict) -> Dict[str, str]:
-    """Return dict with verdict + active_status."""
-    reasons = []
-    email_lower = email.strip().lower()
+    try:
+        validate_email(email)
+    except EmailNotValidError:
+        write_cache(db_path, email, "bad", "invalid", "inactive", None)
+        return {"email": email, "verdict": "bad", "reason": "invalid", "active_status": "inactive"}
 
-    if not is_syntax_valid(email_lower):
-        return {"email": email_lower, "verdict": "bad", "active_status": "inactive", "reasons": ["invalid-syntax"]}
+    domain = domain_from_email(email)
+    if not domain:
+        write_cache(db_path, email, "bad", "invalid_domain", "inactive", None)
+        return {"email": email, "verdict": "bad", "reason": "invalid_domain", "active_status": "inactive"}
 
-    domain = domain_from_email(email_lower)
+    if is_disposable(domain):
+        write_cache(db_path, email, "risky", "disposable", "unknown", domain)
+        return {"email": email, "verdict": "risky", "reason": "disposable", "active_status": "unknown"}
 
-    if is_disposable_domain(domain):
-        reasons.append("disposable-domain")
+    mx_hosts = mx_cache.get(domain, [])
+    if not mx_hosts:
+        write_cache(db_path, email, "bad", "no-mx", "inactive", domain)
+        return {"email": email, "verdict": "bad", "reason": "no-mx", "active_status": "inactive"}
 
-    if domain in mx_cache:
-        mx_exists = mx_cache[domain]
-    else:
-        mx_exists = has_mx_record(domain)
-        mx_cache[domain] = mx_exists
+    if premium:
+        status = smtp_probe(mx_hosts[0], email)
+        if status == "active":
+            write_cache(db_path, email, "good", "smtp-active", "active", domain)
+            return {"email": email, "verdict": "good", "reason": "smtp-active", "active_status": "active"}
+        elif status == "inactive":
+            write_cache(db_path, email, "bad", "smtp-reject", "inactive", domain)
+            return {"email": email, "verdict": "bad", "reason": "smtp-reject", "active_status": "inactive"}
+        else:
+            write_cache(db_path, email, "risky", "smtp-unknown", "unknown", domain)
+            return {"email": email, "verdict": "risky", "reason": "smtp-unknown", "active_status": "unknown"}
 
-    if not mx_exists:
-        reasons.append("no-mx-record")
-        return {"email": email_lower, "verdict": "bad", "active_status": "inactive", "reasons": reasons}
+    write_cache(db_path, email, "good", "syntax+mx", "unknown", domain)
+    return {"email": email, "verdict": "good", "reason": "syntax+mx", "active_status": "unknown"}
 
-    smtp_status = smtp_check(email_lower, domain, premium)
-    if smtp_status == "active":
-        return {"email": email_lower, "verdict": "good", "active_status": "active", "reasons": ["smtp-accept"]}
-    elif smtp_status == "inactive":
-        return {"email": email_lower, "verdict": "bad", "active_status": "inactive", "reasons": ["smtp-reject"]}
-    else:
-        if "disposable-domain" in reasons:
-            return {"email": email_lower, "verdict": "risky", "active_status": "inactive", "reasons": reasons}
-        return {"email": email_lower, "verdict": "risky", "active_status": "unknown", "reasons": reasons or ["smtp-unknown"]}
+# Main Verification Runner
+def run_verification(input_path, output_path, workers, premium, db_path, job_id=None, progress_store=None):
+    init_cache(db_path)
+    os.makedirs(output_path, exist_ok=True)
+    emails = []
 
-# --------------------------- File Handlers ---------------------------
+    # Debug: Log input path
+    with open("debug_emails.log", "a") as f:
+        f.write(f"Processing input: {input_path}\n")
 
-def process_txt(path: str, output_path: str, premium: bool, mx_cache: dict, args=None):
-    with open(path, 'r', encoding='utf-8', errors='ignore') as f:
-        text = f.read()
-    emails = find_emails_in_text(text)
-
-    if args and hasattr(args, "job_id") and hasattr(args, "progress_store"):
-        args.progress_store[args.job_id]["total"] += len(emails)
-
-    rows = []
-    for e in emails:
-        verdict = classify_email(e, premium, mx_cache)
-        rows.append({
-            "filename": os.path.basename(path),
-            "email": e,
-            "verdict": verdict["verdict"],
-            "active_status": verdict["active_status"],
-            "reasons": ";".join(verdict["reasons"]),
-        })
-        if args and hasattr(args, "job_id") and hasattr(args, "progress_store"):
-            args.progress_store[args.job_id]["done"] += 1
-
-    out_file = os.path.join(output_path, os.path.basename(path) + ".emails.csv")
-    with open(out_file, "w", newline="", encoding="utf-8") as csvf:
-        writer = csv.DictWriter(csvf, fieldnames=["filename", "email", "verdict", "active_status", "reasons"])
-        writer.writeheader()
-        writer.writerows(rows)
-    print(f"Wrote: {out_file}")
-
-def process_csv(path: str, output_path: str, premium: bool, mx_cache: dict, args=None):
-    df = pd.read_csv(path, dtype=str, keep_default_na=False)
-
-    if args and hasattr(args, "job_id") and hasattr(args, "progress_store"):
-        args.progress_store[args.job_id]["total"] += len(df)
-
-    rows = []
-    for _, row in df.iterrows():
-        found_emails = []
-        for col in row:
-            emails = find_emails_in_text(str(col))
-            found_emails.extend(emails)
-        for e in found_emails:
-            verdict = classify_email(e, premium, mx_cache)
-            rows.append({
-                "filename": os.path.basename(path),
-                "email": e,
-                "verdict": verdict["verdict"],
-                "active_status": verdict["active_status"],
-                "reasons": ";".join(verdict["reasons"]),
-            })
-        if args and hasattr(args, "job_id") and hasattr(args, "progress_store"):
-            args.progress_store[args.job_id]["done"] += 1
-
-    out_file = os.path.join(output_path, os.path.basename(path) + ".emails.csv")
-    with open(out_file, "w", newline="", encoding="utf-8") as csvf:
-        writer = csv.DictWriter(csvf, fieldnames=["filename", "email", "verdict", "active_status", "reasons"])
-        writer.writeheader()
-        writer.writerows(rows)
-    print(f"Wrote: {out_file}")
-
-# --------------------------- Orchestration ---------------------------
-
-def process_file(path: str, output_path: str, premium: bool, mx_cache: dict, args=None):
-    _, ext = os.path.splitext(path)
-    ext = ext.lower()
-    if ext in (".txt", ".text"):
-        process_txt(path, output_path, premium, mx_cache, args=args)
-    elif ext == ".csv":
-        process_csv(path, output_path, premium, mx_cache, args=args)
-    else:
-        print(f"Skipping unsupported file type: {path}")
-
-def main(args):
-    input_path = args.input
-    output_path = args.output
-    concurrency = args.workers or MAX_WORKERS
-    premium = args.premium
-
-    if not os.path.exists(output_path):
-        os.makedirs(output_path)
-
-    mx_cache = {}
-
-    files = []
     if os.path.isdir(input_path):
-        for fname in os.listdir(input_path):
-            full = os.path.join(input_path, fname)
-            if os.path.isfile(full):
-                files.append(full)
+        for fn in os.listdir(input_path):
+            if fn.endswith((".txt", ".csv")):
+                with open(os.path.join(input_path, fn), "r", encoding="utf-8", errors="ignore") as f:
+                    emails += extract_emails_from_text(f.read())
     elif os.path.isfile(input_path):
-        files = [input_path]
+        with open(input_path, "r", encoding="utf-8", errors="ignore") as f:
+            emails += extract_emails_from_text(f.read())
     else:
-        print("Input path not found")
+        with open("debug_emails.log", "a") as f:
+            f.write(f"Input not found: {input_path}\n")
+        if progress_store and job_id:
+            progress_store[job_id]["status"] = "error"
+            progress_store[job_id]["error"] = "Input file or directory not found"
         return
 
-    print(f"Found {len(files)} files to process")
+    emails = list(set(emails))
+    with open("debug_emails.log", "a") as f:
+        f.write(f"Found emails: {emails}\n")
+    if progress_store and job_id:
+        progress_store[job_id]["total"] = len(emails)
 
-    with ThreadPoolExecutor(max_workers=concurrency) as ex:
-        futures = [ex.submit(process_file, f, output_path, premium, mx_cache, args=args) for f in files]
-        for fut in as_completed(futures):
-            fut.result()
+    domains = {domain_from_email(e) for e in emails if domain_from_email(e)}
+    with open("debug_emails.log", "a") as f:
+        f.write(f"Resolving MX for domains: {domains}\n")
+    mx_cache = resolve_mx_bulk(domains, max_workers=workers)
 
-    print("All done.")
+    results = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+        futures = [ex.submit(classify_email, e, mx_cache, db_path, premium) for e in emails]
+        for fut in tqdm(concurrent.futures.as_completed(futures), total=len(futures), desc="Verifying"):
+            results.append(fut.result())
+            if progress_store and job_id:
+                progress_store[job_id]["done"] += 1
 
-# --------------------------- CLI ---------------------------
+    out = os.path.join(output_path, "verified_results.csv")
+    if os.path.exists(out):
+        out = os.path.join(output_path, "verified_results_new.csv")
+
+    with open(out, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=["email", "verdict", "reason", "active_status"])
+        writer.writeheader()
+        writer.writerows(results)
+
+    with open("debug_emails.log", "a") as f:
+        f.write(f"Results saved to: {out}\n")
+
+# Main Entry for CLI / API
+def main(args):
+    """Entry point for CLI and API"""
+    run_verification(
+        input_path=args.input,
+        output_path=args.output,
+        workers=args.workers,
+        premium=args.premium,
+        db_path="email_cache_v3.db",
+        job_id=getattr(args, 'job_id', None),
+        progress_store=getattr(args, 'progress_store', None),
+    )
+
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Email Verifier with Live Progress")
-    parser.add_argument("--input", "-i", required=True, help="Input folder or file path")
-    parser.add_argument("--output", "-o", required=True, help="Output folder to write results")
-    parser.add_argument("--workers", "-w", type=int, required=False, help="Concurrency (default 10)")
-    parser.add_argument("--premium", action="store_true", help="Enable deeper SMTP checks for premium clients")
+    print("===========================================")
+    print("     Email Verifier v3.8 - Free & Premium  ")
+    print("===========================================")
 
+    init_license()
+    info = get_license_info()
+
+    if not info.get("premium"):
+        print("\n🔒 Free Mode Active (DNS + MX only).")
+        choice = input("Do you want to activate Premium Mode? (y/n): ").strip().lower()
+        if choice == "y":
+            email = input("Enter your email: ").strip()
+            print(f"🔑 Your license key (for testing): {get_hash(email)}")
+            key = input("Enter your license key: ").strip()
+            if activate_license(email, key):
+                print("✅ Premium license activated successfully!")
+            else:
+                print("❌ Invalid license key. Continuing in Free Mode.")
+        else:
+            print("Continuing in Free Mode...")
+
+    premium = is_premium()
+    print(f"\n🚀 Running in {'PREMIUM' if premium else 'FREE'} MODE\n")
+
+    parser = argparse.ArgumentParser(description="Email Verifier CLI")
+    parser.add_argument("--input", "-i", required=True, help="Input file or folder")
+    parser.add_argument("--output", "-o", required=True, help="Output folder")
+    parser.add_argument("--workers", "-w", type=int, default=50, help="Concurrent threads")
+    parser.add_argument("--premium", action="store_true", help="Enable deeper SMTP checks (optional override)")
     args = parser.parse_args()
-    main(args)
+
+    if args.premium:
+        premium = True
+
+    run_verification(args.input, args.output, args.workers, premium, "email_cache_v3.db")

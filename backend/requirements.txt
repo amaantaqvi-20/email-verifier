@@ -1,15 +1,7 @@
 fastapi
 uvicorn[standard]
-pandas
-openpyxl
-PyPDF2
-python-docx
 dnspython
 tldextract
-requests
-python-multipart
-pydantic
-redis
-rq
-aiodns
 tqdm
+email_validator
+python-multipart
